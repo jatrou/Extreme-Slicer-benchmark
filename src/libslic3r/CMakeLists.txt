@@ -499,8 +499,9 @@ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${lisbslic3r_sources})
 
 if (SLIC3R_ENABLE_CUDA_SLICER)
     # Visual Studio's CUDA rule supplies host options through -Xcompiler.
-    # Keep CMake's CUDA flag cache empty so MSVC switches are not emitted as
-    # standalone NVCC options (CUDA 13.x rejects that form).
+    # Leave CMake's CUDA flags at their toolchain defaults: clearing the
+    # configuration flags strips MSVC metadata needed by CUDA's VS targets
+    # during compiler checks (including DebugInformationFormat and RTC).
     set(CUDA_PROPAGATE_HOST_FLAGS OFF)
     set(CudaToolkitDir "$ENV{CUDA_PATH}" CACHE PATH "CUDA toolkit directory for Visual Studio CUDA rules")
     if (NOT CudaToolkitDir OR NOT EXISTS "${CudaToolkitDir}")
@@ -511,12 +512,6 @@ if (SLIC3R_ENABLE_CUDA_SLICER)
     # targets built later in the solution see the same toolkit directory.
     set(CMAKE_MSVC_CUDA_TOOLKIT_DIR "${CudaToolkitDir}" CACHE PATH "CUDA toolkit directory exported to MSBuild" FORCE)
     set(CMAKE_VS_GLOBALS "CudaToolkitCustomDir=${CudaToolkitDir};CUDA_PATH_V13_2=${CudaToolkitDir}" CACHE STRING "CUDA MSBuild globals" FORCE)
-    if (MSVC)
-        foreach (_cuda_config "" "_DEBUG" "_MINSIZEREL" "_RELEASE" "_RELWITHDEBINFO")
-            set(CMAKE_CUDA_FLAGS${_cuda_config} "" CACHE STRING "" FORCE)
-        endforeach ()
-        set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH "MSVC host compiler for CUDA" FORCE)
-    endif ()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_sources(libslic3r PRIVATE Gpu/CudaSlicer.cu)
@@ -743,6 +738,17 @@ if (APPLE)
 endif ()
 
 if (TARGET OpenVDB::openvdb)
+    if (MSVC AND SLIC3R_ENABLE_CUDA_SLICER AND TARGET IlmBase::Half)
+        # OpenVDB exposes IlmBase::Half to consumers. Its imported target
+        # exports a raw /EHsc option, which Visual Studio passes to NVCC as
+        # a standalone option in this mixed C++/CUDA target. MSVC C++ gets
+        # /EHsc from CMAKE_CXX_FLAGS; CUDA forwards the host flag separately.
+        get_target_property(_ilm_half_options IlmBase::Half INTERFACE_COMPILE_OPTIONS)
+        if (_ilm_half_options)
+            list(REMOVE_ITEM _ilm_half_options "/EHsc")
+            set_property(TARGET IlmBase::Half PROPERTY INTERFACE_COMPILE_OPTIONS "${_ilm_half_options}")
+        endif ()
+    endif ()
     target_link_libraries(libslic3r PRIVATE OpenVDB::openvdb)
 endif()
 
