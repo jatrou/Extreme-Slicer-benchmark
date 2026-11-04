@@ -26,13 +26,17 @@
 #include <csignal>
 #include <atomic>
 #include <new>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <stdexcept>
+
+#include "nlohmann/json.hpp"
 
 #if defined(__linux__) || defined(__LINUX__)
 #include <condition_variable>
 #include <mutex>
 #include <boost/thread.hpp>
-//add json logic
-#include "nlohmann/json.hpp"
 
 using namespace nlohmann;
 #endif
@@ -69,6 +73,7 @@ using namespace nlohmann;
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/BlacklistedLibraryCheck.hpp"
 #include "libslic3r/FlushVolCalc.hpp"
+#include "libslic3r/Gpu/VulkanSlicer.hpp"
 
 #include "libslic3r/Orient.hpp"
 #include "libslic3r/PNGReadWrite.hpp"
@@ -6227,6 +6232,58 @@ int CLI::run(int argc, char **argv)
                                 const PrintConfig& print_config = print_fff->config();
                                 Model::setExtruderParams(m_print_config, filament_count);
                                 Model::setPrintSpeedTable(m_print_config, print_config);
+                                // Benchmark selection is intentionally CLI-only and opt-in. Keep
+                                // ordinary slicing, presets, and project data untouched.
+                                const char* bench_backend_env = std::getenv("ORCA_BENCH_BACKEND");
+                                const bool bench_enabled = bench_backend_env && *bench_backend_env;
+                                std::string bench_backend;
+                                if (bench_enabled) {
+                                    bench_backend = bench_backend_env;
+                                    if (bench_backend != "cpu" && bench_backend != "cuda")
+                                        throw std::runtime_error("ORCA_BENCH_BACKEND must be cpu or cuda");
+                                    if (load_slicedata)
+                                        throw std::runtime_error("ORCA_BENCH_BACKEND cannot be used with --load-slicedata");
+
+                                    bool strict_validation = false;
+                                    if (const char* strict_env = std::getenv("ORCA_BENCH_STRICT")) {
+                                        if (std::strcmp(strict_env, "0") != 0 && std::strcmp(strict_env, "1") != 0)
+                                            throw std::runtime_error("ORCA_BENCH_STRICT must be 0 or 1");
+                                        strict_validation = std::strcmp(strict_env, "1") == 0;
+                                    }
+
+                                    uint32_t batch_size = 64;
+                                    if (const char* batch_env = std::getenv("ORCA_BENCH_BATCH_SIZE")) {
+                                        const std::string value(batch_env);
+                                        if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
+                                            throw std::runtime_error("ORCA_BENCH_BATCH_SIZE must be an integer from 16 to 4096");
+                                        unsigned long parsed = 0;
+                                        try {
+                                            parsed = std::stoul(value);
+                                        } catch (const std::exception&) {
+                                            throw std::runtime_error("ORCA_BENCH_BATCH_SIZE must be an integer from 16 to 4096");
+                                        }
+                                        if (parsed < 16 || parsed > 4096)
+                                            throw std::runtime_error("ORCA_BENCH_BATCH_SIZE must be an integer from 16 to 4096");
+                                        batch_size = uint32_t(parsed);
+                                    }
+
+                                    Gpu::VulkanSlicerBackend::set_backend_preference(
+                                        bench_backend == "cuda" ? Gpu::ComputeBackendPreference::Cuda : Gpu::ComputeBackendPreference::Cpu);
+                                    Gpu::VulkanSlicerBackend::set_cuda_enabled(bench_backend == "cuda");
+                                    Gpu::VulkanSlicerBackend::set_compute_enabled(false); // No Vulkan fallback in a CUDA benchmark.
+                                    Gpu::VulkanSlicerBackend::set_batch_size(batch_size);
+                                    Gpu::VulkanSlicerBackend::set_strict_validation(strict_validation);
+                                    Gpu::VulkanSlicerBackend::begin_slicing_session();
+                                    // prepare_for_slicing queries CUDA capabilities even in CPU mode.
+                                    // Leave the CPU run free of CUDA initialization and device resets.
+                                    if (bench_backend == "cuda") {
+                                        const bool backend_ready = Gpu::VulkanSlicerBackend::prepare_for_slicing();
+                                        const auto backend_stats = Gpu::VulkanSlicerBackend::query_runtime_stats();
+                                        if (!backend_ready || backend_stats.active_backend != "CUDA")
+                                            throw std::runtime_error("CUDA benchmark requested but CUDA is unavailable: " + backend_stats.last_diagnostic);
+                                    }
+                                }
+                                const auto bench_process_begin = std::chrono::steady_clock::now();
                                 if (load_slicedata) {
                                     std::string plate_dir = load_slice_data_dir+"/"+std::to_string(index+1);
                                     int ret = print->load_cached_data(plate_dir);
@@ -6250,6 +6307,41 @@ int CLI::run(int argc, char **argv)
                                 else {
                                     print->process(&time_using_cache);
                                     BOOST_LOG_TRIVIAL(info) << "print::process: first time_using_cache is " << time_using_cache << " secs.";
+                                }
+                                if (bench_enabled) {
+                                    const double process_wall_ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - bench_process_begin).count();
+                                    const auto stats = Gpu::VulkanSlicerBackend::query_runtime_stats();
+                                    const bool cuda_run = bench_backend == "cuda";
+                                    const bool gpu_performance_valid = cuda_run && stats.active_backend == "CUDA" &&
+                                        stats.accepted_gpu_intersections > 0 && stats.validation_failures == 0;
+                                    const char* outcome = !cuda_run ? "cpu_complete" :
+                                        stats.validation_failures > 0 ? "validation_failed" :
+                                        stats.accepted_gpu_intersections == 0 ? "no_gpu_work" :
+                                        stats.active_backend != "CUDA" ? "cuda_fallback" : "cuda_complete";
+                                    nlohmann::json benchmark = {
+                                        {"plate", index + 1},
+                                        {"requested_backend", bench_backend},
+                                        {"active_backend", cuda_run ? stats.active_backend : "CPU"},
+                                        {"device", cuda_run ? stats.selected_device : ""},
+                                        {"validation_mode", cuda_run ? stats.validation_mode : "none"},
+                                        {"configured_batch_size", stats.configured_batch_size},
+                                        {"process_wall_ms", process_wall_ms},
+                                        {"dispatch_calls", stats.dispatch_calls},
+                                        {"submitted_intersections", stats.submitted_intersections},
+                                        {"accepted_gpu_intersections", stats.accepted_gpu_intersections},
+                                        {"cpu_validation_checks", stats.cpu_validation_checks},
+                                        {"validation_failures", stats.validation_failures},
+                                        {"total_gpu_ms", stats.total_gpu_ms},
+                                        {"total_host_ms", stats.total_host_ms},
+                                        {"gpu_work_observed", stats.accepted_gpu_intersections > 0},
+                                        {"gpu_performance_valid", gpu_performance_valid},
+                                        {"outcome", outcome},
+                                        {"diagnostic", cuda_run ? stats.last_diagnostic : "CPU-only benchmark mode; GPU initialization skipped."}
+                                    };
+                                    boost::nowide::cout << "ORCA_BENCH_RESULT " << benchmark.dump() << std::endl;
+                                    if (cuda_run)
+                                        Gpu::VulkanSlicerBackend::release_unused_staging_memory();
                                 }
                                 if (printer_technology == ptFFF) {
                                     // Read the engine's final grouping back onto the plate so an exported
@@ -7323,6 +7415,10 @@ bool CLI::setup(int argc, char **argv)
 
 void attach_console_on_demand(){
 #ifdef _WIN32
+    // The opt-in benchmark launcher already supplies redirected streams.
+    // Preserve its log handles, including when reporting CLI usage errors.
+    if (const char* backend = std::getenv("ORCA_BENCH_BACKEND"); backend && *backend)
+        return;
     static bool console_attached = false;
 
     if (!console_attached) {
